@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 
+import requests
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -39,7 +40,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/task текст — задача\n"
         "/tasks — задачи\n"
         "/done номер — закрыть задачу\n"
-        "Можно просто написать или прислать голосовое (пока лучше текстом)."
+        "Можно писать текстом или прислать голосовое."
     )
 
 
@@ -100,10 +101,20 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Закрыл: {mem['tasks'][idx]['text']}")
 
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    if not text:
-        return
+def transcribe(path: Path) -> str:
+    with path.open("rb") as f:
+        r = requests.post(
+            "https://api.x.ai/v1/stt",
+            headers={"Authorization": f"Bearer {os.environ['XAI_API_KEY']}"},
+            data={"model": "grok-voice-transcribe-2.0", "language": "ru", "format": "true"},
+            files={"file": (path.name, f, "audio/ogg")},
+            timeout=60,
+        )
+    r.raise_for_status()
+    return (r.json().get("text") or "").strip()
+
+
+async def reply_text(update: Update, text: str) -> None:
     mem = load_mem()
     extra = ""
     if mem["notes"] or mem["tasks"]:
@@ -125,6 +136,36 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(answer[:4000])
 
 
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    await reply_text(update, text)
+
+
+async def voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    media = msg.voice or msg.audio
+    if not media:
+        return
+    await msg.reply_text("Слушаю...")
+    tg_file = await media.get_file()
+    path = DATA / f"voice_{media.file_id[-8:]}.ogg"
+    await tg_file.download_to_drive(path)
+    try:
+        text = transcribe(path)
+    except Exception as e:
+        await msg.reply_text(f"Не разобрал голос. ({e.__class__.__name__})")
+        return
+    finally:
+        if path.exists():
+            path.unlink()
+    if not text:
+        await msg.reply_text("Тишина, повторите.")
+        return
+    await reply_text(update, text)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -139,6 +180,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tasks", tasks))
     app.add_handler(CommandHandler("done", done))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice))
     app.run_polling(drop_pending_updates=True)
 
 
